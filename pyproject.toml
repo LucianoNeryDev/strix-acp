@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "strix-acp"
+dynamic = ["version"]
+description = "Agent Client Protocol server for Strix, the autonomous penetration-testing agent"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "Luciano Nery", email = "luciano@lucianonery.dev" }]
+keywords = ["acp", "agent-client-protocol", "strix", "security", "pentest", "editor"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Information Technology",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Security",
+]
+dependencies = []
+
+[project.scripts]
+strix-acp = "strix_acp.server:main"
+
+[project.urls]
+Homepage = "https://lucianonery.dev"
+Source = "https://git.lucianonery.dev/LucianoNeryDev/strix-acp"
+Issues = "https://git.lucianonery.dev/LucianoNeryDev/strix-acp/issues"
+
+[tool.hatch.version]
+path = "src/strix_acp/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/strix_acp"]
