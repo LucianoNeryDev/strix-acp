@@ -61,6 +61,26 @@ SCOPE_MODES: tuple[tuple[str, str, str], ...] = (
 # spec it can stage. Anything else that exists on disk is workspace material.
 SPEC_SUFFIXES: frozenset[str] = frozenset({".json", ".yaml", ".yml"})
 
+
+def _docker_probe_timeout() -> float:
+    """Seconds to wait for ``docker info`` before calling the daemon unresponsive.
+
+    A cold or busy daemon (large image stores on spinning disks, a daemon
+    restarting) can take well over ten seconds, and a hung one never answers.
+    ``STRIX_DOCKER_PROBE_TIMEOUT`` overrides the default for slow hosts and for
+    tests.
+    """
+    raw = os.environ.get("STRIX_DOCKER_PROBE_TIMEOUT", "").strip()
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = 0.0
+        if value > 0:
+            return value
+    return 30.0
+
+
 # Strix run names look like ``demonicscans-org_b733``: slug plus a short hash.
 # A head token matching this shape is a run selector even when it does not
 # resolve, so a typo fails loudly instead of becoming an instruction.
@@ -1386,7 +1406,29 @@ class StrixAcpServer:
                 self.emit_text(s.session_id, "Docker binary not found in `PATH`. Strix requires Docker for its sandbox.")
                 self.send_result(req_id, {"stopReason": "end_turn"})
                 return
-            probe = subprocess.run([docker_bin, "info"], capture_output=True, text=True, timeout=10)
+            timeout = _docker_probe_timeout()
+            try:
+                probe = subprocess.run(
+                    [docker_bin, "info"], capture_output=True, text=True, timeout=timeout
+                )
+            except subprocess.TimeoutExpired:
+                self.emit_text(
+                    s.session_id,
+                    f"`docker info` did not answer within {timeout:g}s, so the Strix sandbox "
+                    "cannot be checked. The daemon is hung, restarting, or the host is "
+                    "starved of I/O. Wait for it to recover and send the prompt again; set "
+                    "`STRIX_DOCKER_PROBE_TIMEOUT` to allow more time on a slow host.",
+                )
+                self.send_result(req_id, {"stopReason": "end_turn"})
+                return
+            except OSError as exc:
+                self.emit_text(
+                    s.session_id,
+                    f"Cannot run `docker info`: {exc}\n\nStrix needs a working Docker daemon "
+                    "for its sandbox.",
+                )
+                self.send_result(req_id, {"stopReason": "end_turn"})
+                return
             if probe.returncode != 0:
                 detail = (probe.stderr or probe.stdout or "").strip()
                 self.emit_text(s.session_id, f"Docker daemon is not reachable for Strix sandbox:\n```\n{detail}\n```")

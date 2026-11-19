@@ -101,8 +101,8 @@ class AcpServerTest(unittest.TestCase):
         self.assertEqual(update["params"]["update"]["sessionUpdate"], "available_commands_update")
         return init, session
 
-    def start(self):
-        env = {**self.env, "PYTHONPATH": str(ROOT / "src")}
+    def start(self, extra_env=None):
+        env = {**self.env, "PYTHONPATH": str(ROOT / "src"), **(extra_env or {})}
         return subprocess.Popen(
             [sys.executable, "-m", "strix_acp.server"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -155,6 +155,33 @@ class AcpServerTest(unittest.TestCase):
                             "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "/runs"}]}})
             texts = self.texts(self.read_until(proc, 3))
             self.assertTrue(any("mock-run" in t for t in texts), texts)
+        finally:
+            self.close(proc)
+
+    def test_docker_probe_timeout_is_reported_not_raised(self):
+        docker = self.home / "docker"
+        docker.write_text("#!/bin/sh\nsleep 5\n")
+        docker.chmod(0o755)
+
+        proc = self.start({"STRIX_DOCKER_PROBE_TIMEOUT": "1"})
+        try:
+            self.rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": 1}})
+            self.read_until(proc, 1)
+            self.rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "session/new",
+                            "params": {"cwd": str(self.work), "mcpServers": []}})
+            sid = self.read_until(proc, 2)[-1]["result"]["sessionId"]
+            proc.stdout.readline()
+
+            self.rpc(proc, {"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+                            "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "/scan demo.example"}]}})
+            msgs = self.read_until(proc, 3)
+            self.assertNotIn("error", msgs[-1])
+            self.assertEqual(msgs[-1]["result"]["stopReason"], "end_turn")
+            self.assertTrue(
+                any("did not answer within 1s" in t for t in self.texts(msgs)),
+                self.texts(msgs),
+            )
+            self.assertFalse(self.argv_log.exists() and self.argv_log.read_text().strip())
         finally:
             self.close(proc)
 

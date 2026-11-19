@@ -12,6 +12,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Forgejo Actions workflow that runs the test suite on Python 3.11 and 3.13 and
   builds the wheel.
 - Tests for adapter behaviours that were only covered in the original harness.
+- Files attached to a prompt are staged in the sandbox workspace with
+  `--workspace-file` and named in the instruction, on a fresh run and on a
+  resume.
+
+### Fixed
+
+- A local file was turned into a scan target, which Strix rejects with `Path
+  exists but is not a directory` before the scan starts. Existing non-spec files
+  are now context, and an explicit `-t` on one returns an actionable error.
+- A `docker info` probe that times out or cannot be executed is reported as a
+  message instead of failing the prompt with an internal error. The probe now
+  allows 30 seconds, and `STRIX_DOCKER_PROBE_TIMEOUT` overrides it.
 
 ## [1.9.0] - 2026-11-19
 
