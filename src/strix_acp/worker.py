@@ -211,6 +211,7 @@ async def do_scan(args):
     from strix.config import load_settings
     from strix.core.runner import run_strix_scan
     from strix.interface.scan_setup import build_targets_info, preflight_model_connection, prepare_run
+    from strix.interface.utils import read_workspace_files, resolve_workspace_files
     from strix.report.state import ReportState, set_global_report_state
     from strix.runtime import session_manager
 
@@ -250,6 +251,26 @@ async def do_scan(args):
         except Exception as exc:
             emit("error", message=f"Cannot resume `{args.resume}`: {exc}")
             return 1
+        if args.workspace_file:
+            try:
+                additions = resolve_workspace_files(args.workspace_file)
+            except Exception as exc:
+                emit("error", message=f"Cannot stage attached files: {exc}")
+                return 1
+            merged = list(scan_ns.workspace_files or [])
+            taken = {entry.get("workspace_path") for entry in merged}
+            for addition in additions:
+                if addition["workspace_path"] in taken:
+                    emit(
+                        "error",
+                        message=(
+                            "Cannot stage attached files: the run already places a file at "
+                            f"`{addition['workspace_path']}`."
+                        ),
+                    )
+                    return 1
+                merged.append(addition)
+            scan_ns.workspace_files = merged
 
         resume_text = (args.instruction or "").strip() or DEFAULT_RESUME_INSTRUCTION
         try:
@@ -268,10 +289,16 @@ async def do_scan(args):
             scope_mode=args.scope_mode,
             diff_base=None,
             non_interactive=True,
-            workspace_files=[],
+            workspace_files=None,
             workspace_mount=None,
             resume=None,
         )
+
+        try:
+            scan_ns.workspace_files = resolve_workspace_files(args.workspace_file)
+        except Exception as exc:
+            emit("error", message=f"Cannot stage attached files: {exc}")
+            return 1
 
         try:
             build_targets_info(scan_ns)
@@ -391,6 +418,7 @@ async def do_scan(args):
             scan_id=scan_ns.run_name,
             image=image,
             local_sources=getattr(scan_ns, "local_sources", None) or [],
+            extra_files=read_workspace_files(getattr(scan_ns, "workspace_files", None)),
             interactive=False,
             model=model,
             event_sink=event_sink,
@@ -436,6 +464,7 @@ def main():
     sc.add_argument("--scan-mode", default="deep")
     sc.add_argument("--scope-mode", default="auto")
     sc.add_argument("--target", action="append", default=[])
+    sc.add_argument("--workspace-file", action="append", default=[])
     sc.add_argument("--instruction", default="")
     sc.add_argument("--resume", default="")
     sc.add_argument("--workspace", default="")

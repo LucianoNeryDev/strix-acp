@@ -18,7 +18,9 @@ sandbox.
 | `https://example.com` | Fresh scan of that target |
 | `/scan <target> [instructions]`, `/quick`, `/standard`, `/deep` | Fresh scan with that mode |
 | any prompt with no target | Continues the session's current run |
-| a prompt naming the run's own target | Continues that run, prompt kept as written |
+| a prompt naming the run's own target or another host on that site | Continues that run, prompt kept as written |
+| a prompt naming the run's target and another site | Continues the run and hands the other site to the agent as added scope |
+| a new thread or fork in a workspace that has runs | Inherits the newest run, so follow-up prompts continue it |
 | `/resume [run\|path] [instruction]` | Continues a named run, a run directory, or the workspace's newest |
 | `/new <target> [instructions]` | Forces a fresh run |
 | `/runs` | Lists runs under the workspace, with finding counts |
@@ -92,7 +94,16 @@ the interactive path performs.
 For the same reason the adapter persists a small per-session state file, so a
 client that restarts and reopens a thread (`session/resume`) can rebuild the
 session and keep working on the same run. A session with no state file adopts the
-newest run in its workspace.
+newest run in its workspace, targets included; so does a brand-new session, which
+is what makes a forked thread continue its parent's run instead of rescanning
+from zero.
+
+Continuity is decided by site, not by string equality: `api.example.com`,
+`https://example.com/login` and `example.com:8443` all belong to a run on
+`example.com`. When a prompt names both that site and an unrelated host, the run
+continues and the unrelated host is delivered to the agent as additional
+authorized scope. Only a prompt whose targets share no site with the run — or an
+explicit `/scan`, `/quick`, `/standard`, `/deep`, `/new` — starts a fresh run.
 
 ## Security notes
 
@@ -113,8 +124,10 @@ python -m unittest discover -s tests -v
 ```
 
 The tests use a fake Strix interpreter (`STRIX_PYTHON`), so they need no Docker,
-no model and no network. The one test that opens a real SDK session is skipped
-unless Strix's Python is installed.
+no model and no network beyond localhost. The two tests that run Strix's own
+code (a preflight against a mock OpenCode Go endpoint, and resume delivery into
+a real SDK session) are skipped unless Strix's Python is installed; point
+`STRIX_PYTHON_REAL` at it if it is not under `~/.local/share/uv/tools/strix-agent`.
 
 ## License
 

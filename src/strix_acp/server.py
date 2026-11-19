@@ -57,10 +57,80 @@ SCOPE_MODES: tuple[tuple[str, str, str], ...] = (
     ("full", "Full", "Scan entire target regardless of git diff"),
 )
 
+# Strix takes a local path as a target only when it is a directory or an API
+# spec it can stage. Anything else that exists on disk is workspace material.
+SPEC_SUFFIXES: frozenset[str] = frozenset({".json", ".yaml", ".yml"})
+
+
+def _docker_probe_timeout() -> float:
+    """Seconds to wait for ``docker info`` before calling the daemon unresponsive.
+
+    A cold or busy daemon (large image stores on spinning disks, a daemon
+    restarting) can take well over ten seconds, and a hung one never answers.
+    ``STRIX_DOCKER_PROBE_TIMEOUT`` overrides the default for slow hosts and for
+    tests.
+    """
+    raw = os.environ.get("STRIX_DOCKER_PROBE_TIMEOUT", "").strip()
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = 0.0
+        if value > 0:
+            return value
+    return 30.0
+
+
 # Strix run names look like ``demonicscans-org_b733``: slug plus a short hash.
 # A head token matching this shape is a run selector even when it does not
 # resolve, so a typo fails loudly instead of becoming an instruction.
 RUN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*_[0-9a-f]{4}$")
+
+
+def target_host(value: str) -> str | None:
+    """Return a comparable host for a URL, bare host, host:port or host/path.
+
+    Local paths and other non-network targets return ``None``; Strix compares
+    those by path, and they are handled separately.
+    """
+    raw = (value or "").strip().strip("\"'<>(){}").rstrip(",;.")
+    if not raw:
+        return None
+    if raw.startswith("git@"):
+        host = raw[len("git@"):].split(":", 1)[0].split("/", 1)[0]
+    elif "://" in raw:
+        host = raw.split("://", 1)[1].split("/", 1)[0]
+    elif raw.startswith(("/", "./", "../", "~")) or raw == "." or Path(raw).is_absolute():
+        return None
+    else:
+        host = raw.split("/", 1)[0]
+    host = host.rsplit("@", 1)[-1]
+    if host.startswith("["):
+        host = host[1:host.index("]")] if "]" in host else host
+    else:
+        host = host.split(":", 1)[0]
+    host = host.lower().strip(".")
+    return host or None
+
+
+def same_site(a: str, b: str) -> bool:
+    """Whether two targets belong to the same site or local scope.
+
+    A run for ``example.com`` covers ``www.example.com`` and
+    ``https://example.com/login``; a run for a directory covers paths inside it.
+    Unrelated hosts are unrelated: continuity is not guessed across sites.
+    """
+    ha, hb = target_host(a), target_host(b)
+    if ha and hb:
+        return ha == hb or ha.endswith("." + hb) or hb.endswith("." + ha)
+    if ha or hb:
+        return False
+    try:
+        pa = Path(a).expanduser().resolve()
+        pb = Path(b).expanduser().resolve()
+    except OSError:
+        return False
+    return pa == pb or pa in pb.parents or pb in pa.parents
 
 # Appended to every T3-driven scan. Kept short because the detailed procedure
 # is the data_access_escalation skill inside Strix.
@@ -304,8 +374,12 @@ class ScanPlan:
     scan_mode: str
     targets: list[str] = field(default_factory=list)
     instruction: str = ""
+    workspace_files: list[str] = field(default_factory=list)
     resume_run: str | None = None
     resume_workspace: str | None = None
+    # Targets in the prompt that the resumed run does not cover yet; they are
+    # authorized by this prompt and passed to the agent as added scope.
+    extra_targets: list[str] = field(default_factory=list)
     error: str = ""
 
 
@@ -600,10 +674,7 @@ class StrixAcpServer:
         if not session.last_run:
             # A reopened thread that predates this state file: adopt the most recent
             # run in its workspace so a follow-up continues instead of rescanning.
-            latest = self._latest_run_name(session.cwd)
-            if latest:
-                session.last_run = latest
-                session.last_run_dir = str(Path(session.cwd) / "strix_runs" / latest)
+            self._adopt_latest_run(session)
         with self._sessions_lock:
             self._sessions[session_id] = session
         self._save_session(session)
@@ -638,6 +709,10 @@ class StrixAcpServer:
             cwd=cwd,
             model_id=self._default_model,
         )
+        # A fork gets a new provider session in the same workspace and the client
+        # sends no fork metadata, so inherit the workspace's newest run here. The
+        # fork then continues that run's state instead of rescanning from zero.
+        adopted = self._adopt_latest_run(session)
         with self._sessions_lock:
             self._sessions[session_id] = session
         self._save_session(session)
@@ -651,6 +726,13 @@ class StrixAcpServer:
                 "configOptions": self._config_options(session),
             },
         )
+        if adopted:
+            self.emit_text(
+                session_id,
+                f"This workspace already has Strix runs, so follow-up prompts continue "
+                f"`{session.last_run}` (`{session.last_run_dir}`). Name a different target "
+                f"for a new scan, or `/new <target>` to force one.\n\n",
+            )
         self.send_update(
             session_id,
             {
@@ -777,6 +859,36 @@ class StrixAcpServer:
         return cleaned.strip()
 
     @staticmethod
+    def _is_local_scan_target(path: Path) -> bool:
+        """True when Strix accepts this local path as a scan target.
+
+        Strix's ``infer_target_type`` accepts a directory or a file it can read
+        as an OpenAPI/Postman spec; a bare source or evidence file is rejected
+        with "Path exists but is not a directory".
+        """
+        try:
+            if path.is_dir():
+                return True
+            return path.is_file() and path.suffix.lower() in SPEC_SUFFIXES
+        except OSError:
+            return False
+
+    @staticmethod
+    def _unusable_local_target(raw: str, cwd: str) -> str | None:
+        """Explain why an explicit target is an unusable local file, else None."""
+        cand = Path(raw).expanduser()
+        if not cand.is_absolute():
+            cand = Path(cwd) / cand
+        if not cand.exists() or StrixAcpServer._is_local_scan_target(cand):
+            return None
+        return (
+            f"`{raw}` is a file, and Strix only accepts a local directory or an "
+            "OpenAPI/Postman spec (`.json`, `.yaml`, `.yml`) as a target.\n\n"
+            f"Scan its directory instead (`{cand.parent.resolve()}`), or attach the "
+            "file to the prompt so it is staged in the sandbox workspace."
+        )
+
+    @staticmethod
     def _looks_like_domain_or_host_target(tok: str, cwd: str) -> str | None:
         cand = tok.strip().strip("\"'<>()[]{}").rstrip(",;.")
         if not cand or cand.startswith("-"):
@@ -804,7 +916,7 @@ class StrixAcpServer:
         # Avoid treating existing non-spec local files (e.g. README.md, app.py) as domains
         local_cand = (Path(cwd) / cand) if not Path(cand).is_absolute() else Path(cand)
         if local_cand.exists():
-            if local_cand.is_dir() or local_cand.suffix.lower() in (".json", ".yaml", ".yml"):
+            if StrixAcpServer._is_local_scan_target(local_cand):
                 return str(local_cand.resolve())
             return None
 
@@ -930,6 +1042,38 @@ class StrixAcpServer:
         return max(candidates, key=lambda c: (c / "run.json").stat().st_mtime).name
 
     @staticmethod
+    def _run_targets(run_dir: Path) -> list[str]:
+        """The targets a run was authorized for, as recorded in its run.json."""
+        try:
+            rec = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        out: list[str] = []
+        for entry in rec.get("targets_info") or []:
+            if not isinstance(entry, dict):
+                continue
+            value = entry.get("original") or entry.get("target") or ""
+            if isinstance(value, str) and value and value not in out:
+                out.append(value)
+        return out
+
+    def _adopt_latest_run(self, session: SessionState) -> bool:
+        """Point a session at its workspace's newest run, targets included.
+
+        Targets matter as much as the name: without them the next prompt that
+        names the run's own site cannot be recognised as a continuation and
+        would start a second run with no access to the first one's state.
+        """
+        latest = self._latest_run_name(session.cwd)
+        if not latest:
+            return False
+        run_dir = Path(session.cwd) / "strix_runs" / latest
+        session.last_run = latest
+        session.last_run_dir = str(run_dir)
+        session.last_targets = self._run_targets(run_dir)
+        return True
+
+    @staticmethod
     def _locate_run(raw: str, cwd: str) -> tuple[str, str] | None:
         """Resolve a run name or a path to (run_name, workspace)."""
         cand = Path(raw).expanduser()
@@ -968,16 +1112,24 @@ class StrixAcpServer:
         - ``/resume [run|path] [instruction]`` resumes the last run, or the named
           one, with the instruction as a new user message.
         - A prompt with no target continues the session's last run.
-        - A prompt that names the same target as the last run continues it too.
+        - A prompt that names the run's own target, or another host on the same
+          site (subdomain, URL with a path, host:port), continues it too; hosts
+          the run does not cover are handed to the agent as added scope.
         - ``/new`` (or ``/scan``, ``/quick``, ``/standard``, ``/deep``) and a
-          different target always start a fresh run.
+          target on a different site always start a fresh run.
         """
         text = prompt_text.strip()
         scan_mode = default_scan_mode
         force_new = False
+        require_target = False
         resume_selector: str | None = None
         resume_requested = False
         resume_instruction = ""
+
+        if last_run and not last_targets:
+            # State written before targets were persisted (or a thread adopted
+            # from its workspace): read them back so continuity can be decided.
+            last_targets = self._run_targets(Path(last_run[1]) / "strix_runs" / last_run[0])
 
         if text.startswith("/resume"):
             resume_requested = True
@@ -994,17 +1146,22 @@ class StrixAcpServer:
             text = ""
         elif text.startswith("/new"):
             force_new = True
+            require_target = True
             text = text[len("/new"):].strip()
         elif text.startswith("/quick"):
             scan_mode = "quick"
+            force_new = True
             text = text[len("/quick"):].strip()
         elif text.startswith("/standard"):
             scan_mode = "standard"
+            force_new = True
             text = text[len("/standard"):].strip()
         elif text.startswith("/deep"):
             scan_mode = "deep"
+            force_new = True
             text = text[len("/deep"):].strip()
         elif text.startswith("/scan"):
+            force_new = True
             text = text[len("/scan"):].strip()
 
         targets: list[str] = []
@@ -1018,11 +1175,19 @@ class StrixAcpServer:
         while i < len(tokens):
             tok = tokens[i]
             if tok in ("-t", "--target") and i + 1 < len(tokens):
-                targets.append(tokens[i + 1])
+                raw_target = tokens[i + 1]
+                unusable = self._unusable_local_target(raw_target, cwd)
+                if unusable:
+                    return ScanPlan(kind="error", scan_mode=scan_mode, error=unusable)
+                targets.append(raw_target)
                 i += 2
                 continue
             if tok.startswith("--target="):
-                targets.append(tok.split("=", 1)[1])
+                raw_target = tok.split("=", 1)[1]
+                unusable = self._unusable_local_target(raw_target, cwd)
+                if unusable:
+                    return ScanPlan(kind="error", scan_mode=scan_mode, error=unusable)
+                targets.append(raw_target)
                 i += 1
                 continue
             if tok in ("--quick", "--standard", "--deep"):
@@ -1039,7 +1204,7 @@ class StrixAcpServer:
                 cand_path = Path(tok).expanduser()
                 if not cand_path.is_absolute():
                     cand_path = Path(cwd) / cand_path
-                if cand_path.exists():
+                if cand_path.exists() and self._is_local_scan_target(cand_path):
                     targets.append(str(cand_path.resolve()))
                     i += 1
                     continue
@@ -1052,6 +1217,24 @@ class StrixAcpServer:
             i += 1
 
         had_explicit_targets = bool(targets)
+
+        # Attached files are context, not targets: Strix would reject a source or
+        # evidence file with "Path exists but is not a directory". Directories and
+        # specs attached as resources can still become the target of a prompt that
+        # names none.
+        attachments: list[str] = []
+        for raw in extra_paths:
+            cand = Path(raw).expanduser()
+            if not cand.exists():
+                continue
+            if self._is_local_scan_target(cand):
+                if not targets:
+                    targets.append(str(cand.resolve()))
+            elif cand.is_file():
+                resolved = str(cand.resolve())
+                if resolved not in attachments:
+                    attachments.append(resolved)
+
         if resume_requested:
             instruction = resume_instruction
             if resume_selector:
@@ -1083,14 +1266,11 @@ class StrixAcpServer:
                 kind="resume",
                 scan_mode=scan_mode,
                 instruction=instruction,
+                workspace_files=attachments,
                 resume_run=run_name,
                 resume_workspace=workspace,
             )
 
-        if not targets:
-            for p in extra_paths:
-                if Path(p).exists():
-                    targets.append(p)
         if not targets and Path(cwd).is_dir():
             targets.append(str(Path(cwd).resolve()))
 
@@ -1102,7 +1282,7 @@ class StrixAcpServer:
             if not tokens or (instruction == " ".join(tokens).strip() and "\n" in text):
                 instruction = text
 
-        if force_new and not had_explicit_targets:
+        if require_target and not had_explicit_targets:
             return ScanPlan(
                 kind="error",
                 scan_mode=scan_mode,
@@ -1112,21 +1292,34 @@ class StrixAcpServer:
         same_target = bool(
             had_explicit_targets
             and last_targets
-            and {t.lower() for t in targets} <= {t.lower() for t in last_targets}
+            and any(same_site(t, known) for t in targets for known in last_targets)
         )
         if (not had_explicit_targets or same_target) and last_run and not force_new:
             run_name, workspace = last_run
+            extra_targets = (
+                [t for t in targets if not any(same_site(t, known) for known in last_targets)]
+                if had_explicit_targets
+                else []
+            )
             return ScanPlan(
                 kind="resume",
                 scan_mode=scan_mode,
                 # Keep the whole prompt: the target is already part of the run, so
                 # dropping it from the instruction would lose the user's wording.
                 instruction=text.strip() or instruction,
+                workspace_files=attachments,
                 resume_run=run_name,
                 resume_workspace=workspace,
+                extra_targets=extra_targets,
             )
 
-        return ScanPlan(kind="fresh", scan_mode=scan_mode, targets=targets, instruction=instruction)
+        return ScanPlan(
+            kind="fresh",
+            scan_mode=scan_mode,
+            targets=targets,
+            instruction=instruction,
+            workspace_files=attachments,
+        )
 
     def _latest_run_tuple(self, cwd: str) -> tuple[str, str] | None:
         name = self._latest_run_name(cwd)
@@ -1304,6 +1497,9 @@ class StrixAcpServer:
                 return
 
             user_text = plan.instruction.strip()
+            if plan.workspace_files:
+                staged = ", ".join(f"`/workspace/{Path(p).name}`" for p in plan.workspace_files)
+                user_text = f"{user_text}\n\nAttached files are staged in the sandbox workspace: {staged}.".strip()
             if user_text:
                 instruction = f"{user_text}\n\n{STANDING_INSTRUCTION}"
             elif plan.kind == "fresh":
@@ -1312,13 +1508,45 @@ class StrixAcpServer:
                 # Bare /resume: the worker seeds its own continue message.
                 instruction = ""
 
+            if plan.kind == "resume" and plan.extra_targets:
+                scope = ", ".join(f"`{t}`" for t in plan.extra_targets)
+                instruction = (
+                    f"{instruction}\n\n"
+                    f"Additional in-scope target(s) authorized by this message: {scope}. "
+                    "Keep this run's existing state and findings: they are part of the "
+                    "same assessment, and the new targets are reachable from what was "
+                    "already found."
+                ).strip()
+
             # Quick Docker daemon pre-check before importing Strix + LiteLLM
             docker_bin = shutil.which("docker")
             if not docker_bin:
                 self.emit_text(s.session_id, "Docker binary not found in `PATH`. Strix requires Docker for its sandbox.")
                 self.send_result(req_id, {"stopReason": "end_turn"})
                 return
-            probe = subprocess.run([docker_bin, "info"], capture_output=True, text=True, timeout=10)
+            timeout = _docker_probe_timeout()
+            try:
+                probe = subprocess.run(
+                    [docker_bin, "info"], capture_output=True, text=True, timeout=timeout
+                )
+            except subprocess.TimeoutExpired:
+                self.emit_text(
+                    s.session_id,
+                    f"`docker info` did not answer within {timeout:g}s, so the Strix sandbox "
+                    "cannot be checked. The daemon is hung, restarting, or the host is "
+                    "starved of I/O. Wait for it to recover and send the prompt again; set "
+                    "`STRIX_DOCKER_PROBE_TIMEOUT` to allow more time on a slow host.",
+                )
+                self.send_result(req_id, {"stopReason": "end_turn"})
+                return
+            except OSError as exc:
+                self.emit_text(
+                    s.session_id,
+                    f"Cannot run `docker info`: {exc}\n\nStrix needs a working Docker daemon "
+                    "for its sandbox.",
+                )
+                self.send_result(req_id, {"stopReason": "end_turn"})
+                return
             if probe.returncode != 0:
                 detail = (probe.stderr or probe.stdout or "").strip()
                 self.emit_text(s.session_id, f"Docker daemon is not reachable for Strix sandbox:\n```\n{detail}\n```")
@@ -1349,12 +1577,22 @@ class StrixAcpServer:
                 self.emit_text(
                     s.session_id,
                     f"Resuming Strix run `{plan.resume_run}` — `{run_dir}`.\n\n"
-                    f"Instruction: {user_text.splitlines()[0][:200] if user_text else '(continue from where it left off)'}\n\n",
+                    + (
+                        "Added scope: "
+                        + ", ".join(f"`{t}`" for t in plan.extra_targets)
+                        + "\n\n"
+                        if plan.extra_targets
+                        else ""
+                    )
+                    + f"Instruction: {user_text.splitlines()[0][:200] if user_text else '(continue from where it left off)'}\n\n",
                 )
                 worker_args.extend(["--resume", plan.resume_run, "--workspace", plan.resume_workspace])
             else:
                 for t in plan.targets:
                     worker_args.extend(["--target", t])
+
+            for staged_file in plan.workspace_files:
+                worker_args.extend(["--workspace-file", staged_file])
 
             _rc, events, cancelled = self._run_worker(s, worker_args, model_override=s.model_id)
             if cancelled:
