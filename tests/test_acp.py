@@ -97,9 +97,26 @@ class AcpServerTest(unittest.TestCase):
         self.rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "session/new",
                         "params": {"cwd": str(self.work), "mcpServers": list(mcp_servers)}})
         session = self.read_until(proc, 2)[-1]["result"]
-        update = json.loads(proc.stdout.readline())
-        self.assertEqual(update["params"]["update"]["sessionUpdate"], "available_commands_update")
+        self.drain_until_commands(proc)
         return init, session
+
+    def drain_until_commands(self, proc, seen=None):
+        """Consume session/new updates up to available_commands_update.
+
+        A new session in a workspace that already has runs also emits a note
+        naming the run it inherited, so the commands update is not always first.
+        """
+        while True:
+            line = proc.stdout.readline()
+            self.assertTrue(line, "unexpected EOF")
+            msg = json.loads(line)
+            if seen is not None:
+                seen.append(msg)
+            if (
+                msg.get("method") == "session/update"
+                and msg["params"]["update"].get("sessionUpdate") == "available_commands_update"
+            ):
+                return msg
 
     def start(self, extra_env=None):
         env = {**self.env, "PYTHONPATH": str(ROOT / "src"), **(extra_env or {})}
@@ -149,7 +166,7 @@ class AcpServerTest(unittest.TestCase):
             self.rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "session/new",
                             "params": {"cwd": str(self.work), "mcpServers": []}})
             sid = self.read_until(proc, 2)[-1]["result"]["sessionId"]
-            proc.stdout.readline()  # available_commands_update
+            self.drain_until_commands(proc)
 
             self.rpc(proc, {"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
                             "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "/runs"}]}})
@@ -170,7 +187,7 @@ class AcpServerTest(unittest.TestCase):
             self.rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "session/new",
                             "params": {"cwd": str(self.work), "mcpServers": []}})
             sid = self.read_until(proc, 2)[-1]["result"]["sessionId"]
-            proc.stdout.readline()
+            self.drain_until_commands(proc)
 
             self.rpc(proc, {"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
                             "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "/scan demo.example"}]}})
@@ -198,11 +215,13 @@ class AcpServerTest(unittest.TestCase):
             self.rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "session/new",
                             "params": {"cwd": str(self.work), "mcpServers": []}})
             sid = self.read_until(proc, 2)[-1]["result"]["sessionId"]
-            proc.stdout.readline()
+            self.drain_until_commands(proc)
 
             self.rpc(proc, {"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
                             "params": {"sessionId": sid, "prompt": [
-                                {"type": "text", "text": "explain what this extractor does"},
+                                # /scan forces a fresh run, which is the path that
+                                # stages the attachment as a workspace file.
+                                {"type": "text", "text": "/scan explain what this extractor does"},
                                 {"type": "resource_link", "uri": f"file://{script}", "name": "extractor.py"},
                             ]}})
             self.read_until(proc, 3)
@@ -224,7 +243,7 @@ class AcpServerTest(unittest.TestCase):
             self.rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "session/new",
                             "params": {"cwd": str(self.work), "mcpServers": []}})
             sid = self.read_until(proc, 2)[-1]["result"]["sessionId"]
-            proc.stdout.readline()
+            self.drain_until_commands(proc)
 
             self.rpc(proc, {"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
                             "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "/scan demo.example"}]}})
@@ -278,7 +297,7 @@ class AcpServerTest(unittest.TestCase):
             self.rpc(first, {"jsonrpc": "2.0", "id": 2, "method": "session/new",
                              "params": {"cwd": str(self.work), "mcpServers": []}})
             sid = self.read_until(first, 2)[-1]["result"]["sessionId"]
-            first.stdout.readline()
+            self.drain_until_commands(first)
             self.rpc(first, {"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
                              "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "/scan demo.example"}]}})
             self.read_until(first, 3)
@@ -295,7 +314,7 @@ class AcpServerTest(unittest.TestCase):
                 resumed = self.read_until(proc, 2)[-1]
                 self.assertNotIn("error", resumed, resumed)
                 self.assertIn("configOptions", resumed.get("result", {}))
-                proc.stdout.readline()
+                self.drain_until_commands(proc)
 
                 self.rpc(proc, {"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
                                 "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "where is the database?"}]}})
@@ -310,6 +329,36 @@ class AcpServerTest(unittest.TestCase):
         for state_file in (self.home / "state").glob("*.json"):
             state_file.unlink()
         reopen("mock-run")
+
+    def test_forked_session_inherits_the_workspace_run(self):
+        """A fork opens a new provider session with no state file and no metadata
+        from the client; it must still continue the workspace's run, including a
+        prompt that names another host on that site."""
+        proc = self.start()
+        try:
+            self.rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": 1}})
+            self.read_until(proc, 1)
+            self.rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "session/new",
+                            "params": {"cwd": str(self.work), "mcpServers": []}})
+            sid = self.read_until(proc, 2)[-1]["result"]["sessionId"]
+            seen = []
+            self.drain_until_commands(proc, seen)
+            self.assertTrue(any("mock-run" in t for t in self.texts(seen)), seen)
+
+            self.rpc(proc, {"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+                            "params": {"sessionId": sid, "prompt": [{"type": "text",
+                             "text": "continue on https://demo.example/login and other.example.net"}]}})
+            texts = self.texts(self.read_until(proc, 3))
+            self.assertTrue(any("Resuming Strix run `mock-run`" in t for t in texts), texts)
+            self.assertTrue(any("Added scope: `other.example.net`" in t for t in texts), texts)
+
+            scans = [c for c in (json.loads(line) for line in self.argv_log.read_text().splitlines()) if "scan" in c]
+            self.assertEqual(len(scans), 1)
+            self.assertEqual(scans[0][scans[0].index("--resume") + 1], "mock-run")
+            instruction = scans[0][scans[0].index("--instruction") + 1]
+            self.assertIn("Additional in-scope target(s) authorized by this message: `other.example.net`", instruction)
+        finally:
+            self.close(proc)
 
     def test_config_preflight_cancel_and_delete(self):
         self.env["STRIX_PYTHON"] = str(self.script("mock-strix-python", (

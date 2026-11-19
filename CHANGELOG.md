@@ -18,6 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A forked or new thread in a workspace that already has runs inherits the
+  newest run, targets included, so its prompts continue that run's state
+  instead of rescanning from zero into a second `strix_runs/` directory.
+- Continuity is matched by site rather than by exact target string: a subdomain,
+  a URL with a path, a host:port or a `www.` variant of the run's target
+  continues the run. A prompt that names the run's site and a different site
+  continues the run and passes the new host to the agent as added scope.
+- `/scan`, `/quick`, `/standard` and `/deep` again force a fresh run on the same
+  target, as documented, instead of being read as a continuation.
 - A local file was turned into a scan target, which Strix rejects with `Path
   exists but is not a directory` before the scan starts. Existing non-spec files
   are now context, and an explicit `-t` on one returns an actionable error.
