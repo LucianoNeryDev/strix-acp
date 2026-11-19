@@ -57,6 +57,10 @@ SCOPE_MODES: tuple[tuple[str, str, str], ...] = (
     ("full", "Full", "Scan entire target regardless of git diff"),
 )
 
+# Strix takes a local path as a target only when it is a directory or an API
+# spec it can stage. Anything else that exists on disk is workspace material.
+SPEC_SUFFIXES: frozenset[str] = frozenset({".json", ".yaml", ".yml"})
+
 # Strix run names look like ``demonicscans-org_b733``: slug plus a short hash.
 # A head token matching this shape is a run selector even when it does not
 # resolve, so a typo fails loudly instead of becoming an instruction.
@@ -304,6 +308,7 @@ class ScanPlan:
     scan_mode: str
     targets: list[str] = field(default_factory=list)
     instruction: str = ""
+    workspace_files: list[str] = field(default_factory=list)
     resume_run: str | None = None
     resume_workspace: str | None = None
     error: str = ""
@@ -777,6 +782,36 @@ class StrixAcpServer:
         return cleaned.strip()
 
     @staticmethod
+    def _is_local_scan_target(path: Path) -> bool:
+        """True when Strix accepts this local path as a scan target.
+
+        Strix's ``infer_target_type`` accepts a directory or a file it can read
+        as an OpenAPI/Postman spec; a bare source or evidence file is rejected
+        with "Path exists but is not a directory".
+        """
+        try:
+            if path.is_dir():
+                return True
+            return path.is_file() and path.suffix.lower() in SPEC_SUFFIXES
+        except OSError:
+            return False
+
+    @staticmethod
+    def _unusable_local_target(raw: str, cwd: str) -> str | None:
+        """Explain why an explicit target is an unusable local file, else None."""
+        cand = Path(raw).expanduser()
+        if not cand.is_absolute():
+            cand = Path(cwd) / cand
+        if not cand.exists() or StrixAcpServer._is_local_scan_target(cand):
+            return None
+        return (
+            f"`{raw}` is a file, and Strix only accepts a local directory or an "
+            "OpenAPI/Postman spec (`.json`, `.yaml`, `.yml`) as a target.\n\n"
+            f"Scan its directory instead (`{cand.parent.resolve()}`), or attach the "
+            "file to the prompt so it is staged in the sandbox workspace."
+        )
+
+    @staticmethod
     def _looks_like_domain_or_host_target(tok: str, cwd: str) -> str | None:
         cand = tok.strip().strip("\"'<>()[]{}").rstrip(",;.")
         if not cand or cand.startswith("-"):
@@ -804,7 +839,7 @@ class StrixAcpServer:
         # Avoid treating existing non-spec local files (e.g. README.md, app.py) as domains
         local_cand = (Path(cwd) / cand) if not Path(cand).is_absolute() else Path(cand)
         if local_cand.exists():
-            if local_cand.is_dir() or local_cand.suffix.lower() in (".json", ".yaml", ".yml"):
+            if StrixAcpServer._is_local_scan_target(local_cand):
                 return str(local_cand.resolve())
             return None
 
@@ -1018,11 +1053,19 @@ class StrixAcpServer:
         while i < len(tokens):
             tok = tokens[i]
             if tok in ("-t", "--target") and i + 1 < len(tokens):
-                targets.append(tokens[i + 1])
+                raw_target = tokens[i + 1]
+                unusable = self._unusable_local_target(raw_target, cwd)
+                if unusable:
+                    return ScanPlan(kind="error", scan_mode=scan_mode, error=unusable)
+                targets.append(raw_target)
                 i += 2
                 continue
             if tok.startswith("--target="):
-                targets.append(tok.split("=", 1)[1])
+                raw_target = tok.split("=", 1)[1]
+                unusable = self._unusable_local_target(raw_target, cwd)
+                if unusable:
+                    return ScanPlan(kind="error", scan_mode=scan_mode, error=unusable)
+                targets.append(raw_target)
                 i += 1
                 continue
             if tok in ("--quick", "--standard", "--deep"):
@@ -1039,7 +1082,7 @@ class StrixAcpServer:
                 cand_path = Path(tok).expanduser()
                 if not cand_path.is_absolute():
                     cand_path = Path(cwd) / cand_path
-                if cand_path.exists():
+                if cand_path.exists() and self._is_local_scan_target(cand_path):
                     targets.append(str(cand_path.resolve()))
                     i += 1
                     continue
@@ -1052,6 +1095,24 @@ class StrixAcpServer:
             i += 1
 
         had_explicit_targets = bool(targets)
+
+        # Attached files are context, not targets: Strix would reject a source or
+        # evidence file with "Path exists but is not a directory". Directories and
+        # specs attached as resources can still become the target of a prompt that
+        # names none.
+        attachments: list[str] = []
+        for raw in extra_paths:
+            cand = Path(raw).expanduser()
+            if not cand.exists():
+                continue
+            if self._is_local_scan_target(cand):
+                if not targets:
+                    targets.append(str(cand.resolve()))
+            elif cand.is_file():
+                resolved = str(cand.resolve())
+                if resolved not in attachments:
+                    attachments.append(resolved)
+
         if resume_requested:
             instruction = resume_instruction
             if resume_selector:
@@ -1083,14 +1144,11 @@ class StrixAcpServer:
                 kind="resume",
                 scan_mode=scan_mode,
                 instruction=instruction,
+                workspace_files=attachments,
                 resume_run=run_name,
                 resume_workspace=workspace,
             )
 
-        if not targets:
-            for p in extra_paths:
-                if Path(p).exists():
-                    targets.append(p)
         if not targets and Path(cwd).is_dir():
             targets.append(str(Path(cwd).resolve()))
 
@@ -1122,11 +1180,18 @@ class StrixAcpServer:
                 # Keep the whole prompt: the target is already part of the run, so
                 # dropping it from the instruction would lose the user's wording.
                 instruction=text.strip() or instruction,
+                workspace_files=attachments,
                 resume_run=run_name,
                 resume_workspace=workspace,
             )
 
-        return ScanPlan(kind="fresh", scan_mode=scan_mode, targets=targets, instruction=instruction)
+        return ScanPlan(
+            kind="fresh",
+            scan_mode=scan_mode,
+            targets=targets,
+            instruction=instruction,
+            workspace_files=attachments,
+        )
 
     def _latest_run_tuple(self, cwd: str) -> tuple[str, str] | None:
         name = self._latest_run_name(cwd)
@@ -1304,6 +1369,9 @@ class StrixAcpServer:
                 return
 
             user_text = plan.instruction.strip()
+            if plan.workspace_files:
+                staged = ", ".join(f"`/workspace/{Path(p).name}`" for p in plan.workspace_files)
+                user_text = f"{user_text}\n\nAttached files are staged in the sandbox workspace: {staged}.".strip()
             if user_text:
                 instruction = f"{user_text}\n\n{STANDING_INSTRUCTION}"
             elif plan.kind == "fresh":
@@ -1355,6 +1423,9 @@ class StrixAcpServer:
             else:
                 for t in plan.targets:
                     worker_args.extend(["--target", t])
+
+            for staged_file in plan.workspace_files:
+                worker_args.extend(["--workspace-file", staged_file])
 
             _rc, events, cancelled = self._run_worker(s, worker_args, model_override=s.model_id)
             if cancelled:
