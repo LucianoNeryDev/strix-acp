@@ -158,6 +158,37 @@ class AcpServerTest(unittest.TestCase):
         finally:
             self.close(proc)
 
+    def test_attached_file_is_staged_as_a_workspace_file(self):
+        evidence = self.work / "strix_runs" / "mock-run" / "evidence"
+        evidence.mkdir(parents=True)
+        script = evidence / "extractor.py"
+        script.write_text("print('x')\n")
+
+        proc = self.start()
+        try:
+            self.rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": 1}})
+            self.read_until(proc, 1)
+            self.rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "session/new",
+                            "params": {"cwd": str(self.work), "mcpServers": []}})
+            sid = self.read_until(proc, 2)[-1]["result"]["sessionId"]
+            proc.stdout.readline()
+
+            self.rpc(proc, {"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+                            "params": {"sessionId": sid, "prompt": [
+                                {"type": "text", "text": "explain what this extractor does"},
+                                {"type": "resource_link", "uri": f"file://{script}", "name": "extractor.py"},
+                            ]}})
+            self.read_until(proc, 3)
+
+            calls = [json.loads(line) for line in self.argv_log.read_text().splitlines()]
+            scan = next(c for c in calls if "scan" in c)
+            self.assertEqual(scan[scan.index("--workspace-file") + 1], str(script))
+            targets = [scan[i + 1] for i, arg in enumerate(scan) if arg == "--target"]
+            self.assertEqual(targets, [str(self.work.resolve())])
+            self.assertIn(f"/workspace/{script.name}", scan[scan.index("--instruction") + 1])
+        finally:
+            self.close(proc)
+
     def test_follow_up_resumes_and_busy_prompt_is_answered(self):
         proc = self.start()
         try:

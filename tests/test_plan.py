@@ -115,6 +115,63 @@ class PlanTest(unittest.TestCase):
         self.assertEqual((prompt, extras), ("example.org", []))
         mode, targets, instr = self.srv._parse_scan_prompt(prompt, str(self.work), extras, "deep")
         self.assertEqual((mode, targets, instr), ("deep", ["example.org"], ""))
+    def test_local_source_file_is_context_not_a_target(self):
+        evidence = self.work / "strix_runs" / "demo_ab12" / "evidence"
+        evidence.mkdir(parents=True)
+        script = evidence / "extractor.py"
+        script.write_text("print('x')\n")
+
+        plan = self.plan(f"/scan {script} explain the extractor")
+        self.assertEqual(plan.kind, "fresh")
+        self.assertEqual(plan.targets, [str(self.work.resolve())])
+        self.assertEqual(plan.workspace_files, [])
+        self.assertIn(str(script), plan.instruction)
+
+        relative = self.plan("/scan ./strix_runs/demo_ab12/evidence/extractor.py explain")
+        self.assertEqual(relative.targets, [str(self.work.resolve())])
+        self.assertIn("./strix_runs/demo_ab12/evidence/extractor.py", relative.instruction)
+
+    def test_explicit_file_target_explains_the_rule(self):
+        script = self.work / "extractor.py"
+        script.write_text("print('x')\n")
+
+        for prompt in (f"/scan -t {script} go", f"/scan --target={script} go"):
+            plan = self.plan(prompt)
+            self.assertEqual(plan.kind, "error")
+            self.assertIn("only accepts a local directory", plan.error)
+            self.assertIn(str(self.work.resolve()), plan.error)
+
+        plan = self.plan("/scan -t extractor.py go")
+        self.assertEqual(plan.kind, "error")
+
+        # A directory or an API spec stays an accepted explicit target.
+        spec = self.work / "api.yaml"
+        spec.write_text("openapi: 3.0.0\n")
+        self.assertEqual(self.plan(f"/scan -t {self.work} go").targets, [str(self.work.resolve())])
+        self.assertEqual(self.plan(f"/scan -t {spec} go").targets, [str(spec.resolve())])
+
+    def test_attached_file_is_staged_not_a_target(self):
+        notes = self.work / "extractor.py"
+        notes.write_text("print('x')\n")
+
+        plan = self.srv._plan_prompt("explain what this does", str(self.work), [str(notes)], "deep", None)
+        self.assertEqual(plan.kind, "fresh")
+        self.assertEqual(plan.targets, [str(self.work.resolve())])
+        self.assertEqual(plan.workspace_files, [str(notes.resolve())])
+
+        # A spec attached as a resource can still be the target.
+        spec = self.work / "api.yaml"
+        spec.write_text("openapi: 3.0.0\n")
+        plan = self.srv._plan_prompt("scan this", str(self.work), [str(spec)], "deep", None)
+        self.assertEqual(plan.targets, [str(spec.resolve())])
+        self.assertEqual(plan.workspace_files, [])
+
+        # An attachment on a continuation is staged for the resumed run too.
+        plan = self.srv._plan_prompt(
+            "look at it", str(self.work), [str(notes)], "deep", ("demo_ab12", str(self.work))
+        )
+        self.assertEqual(plan.kind, "resume")
+        self.assertEqual(plan.workspace_files, [str(notes.resolve())])
 
     def test_clients_wrapper_is_unwrapped(self):
         wrapped = (
