@@ -113,8 +113,10 @@ python -m unittest discover -s tests -v
 ```
 
 The tests use a fake Strix interpreter (`STRIX_PYTHON`), so they need no Docker,
-no model and no network. The one test that opens a real SDK session is skipped
-unless Strix's Python is installed.
+no model and no network beyond localhost. The two tests that run Strix's own
+code (a preflight against a mock OpenCode Go endpoint, and resume delivery into
+a real SDK session) are skipped unless Strix's Python is installed; point
+`STRIX_PYTHON_REAL` at it if it is not under `~/.local/share/uv/tools/strix-agent`.
 
 ## License
 

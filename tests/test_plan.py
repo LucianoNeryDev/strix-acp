@@ -92,6 +92,30 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(targets, ["192.168.1.10", "api.example.org/v1"])
         self.assertEqual(instr, "check and using glm 5.3")
 
+    def test_local_files_as_targets(self):
+        (self.work / "main.py").write_text("print('hi')\n")
+        (self.work / "api.yaml").write_text("openapi: 3.0.0\n")
+
+        # A source filename is not a domain: the scan falls back to the cwd.
+        _, targets, instr = self.srv._parse_scan_prompt("audit main.py", str(self.work), [], "deep")
+        self.assertEqual(targets, [str(self.work.resolve())])
+        self.assertEqual(instr, "audit main.py")
+
+        # A local OpenAPI spec is a target of its own.
+        _, targets, _ = self.srv._parse_scan_prompt("test api.yaml", str(self.work), [], "deep")
+        self.assertEqual(targets, [str((self.work / "api.yaml").resolve())])
+
+    def test_bare_domain_in_wrapper_is_the_target(self):
+        wrapped = (
+            "<t3_code_instructions>\nUse --watch and https://example.invalid/ignore\n</t3_code_instructions>\n\n"
+            "<user_request>\nexample.org\n</user_request>\n\n"
+            "<runtime_info>model=opencode_go/glm-5.3</runtime_info>\n"
+        )
+        prompt, extras = self.srv._extract_prompt([{"type": "text", "text": wrapped}], str(self.work))
+        self.assertEqual((prompt, extras), ("example.org", []))
+        mode, targets, instr = self.srv._parse_scan_prompt(prompt, str(self.work), extras, "deep")
+        self.assertEqual((mode, targets, instr), ("deep", ["example.org"], ""))
+
     def test_clients_wrapper_is_unwrapped(self):
         wrapped = (
             "<client_instructions>ignore https://example.invalid/x</client_instructions>\n\n"
