@@ -51,6 +51,73 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(plan.kind, "fresh")
         self.assertEqual(plan.targets, ["https://other.example.com"])
 
+    def test_same_site_variants_continue_the_run(self):
+        for prompt in (
+            "check https://demo.example/login",
+            "what does api.demo.example expose?",
+            "DEMO.EXAMPLE:8443 runs the admin panel",
+            "is www.demo.example the same app?",
+        ):
+            with self.subTest(prompt=prompt):
+                plan = self.plan(prompt, last=("demo_ab12", str(self.work)), targets=["demo.example"])
+                self.assertEqual(plan.kind, "resume")
+                self.assertEqual(plan.extra_targets, [])
+                self.assertEqual(plan.instruction, prompt)
+
+    def test_related_target_with_a_new_site_resumes_with_added_scope(self):
+        prompt = "continue on other.example.com, it shares the database with demo.example"
+        plan = self.plan(prompt, last=("demo_ab12", str(self.work)), targets=["demo.example"])
+        self.assertEqual(plan.kind, "resume")
+        self.assertEqual(plan.resume_run, "demo_ab12")
+        self.assertEqual(plan.extra_targets, ["other.example.com"])
+        self.assertEqual(plan.instruction, prompt)
+
+    def test_scan_command_forces_a_fresh_run_on_the_same_target(self):
+        plan = self.plan("/scan demo.example", last=("demo_ab12", str(self.work)), targets=["demo.example"])
+        self.assertEqual(plan.kind, "fresh")
+
+    def test_targets_are_read_back_when_state_has_none(self):
+        plan = self.srv._plan_prompt(
+            "explain demo.example", str(self.work), [], "deep",
+            ("demo_ab12", str(self.work)), [],
+        )
+        self.assertEqual(plan.kind, "resume")
+
+    def test_attached_source_file_is_not_a_target(self):
+        script = self.work / "strix_runs" / "demo_ab12" / "evidence" / "extractor.py"
+        script.parent.mkdir(parents=True)
+        script.write_text("print('hi')\n")
+
+        plan = self.srv._plan_prompt(
+            "what did we extract from the database?", str(self.work), [str(script)], "deep",
+            ("demo_ab12", str(self.work)), ["demo.example"],
+        )
+        self.assertEqual(plan.kind, "resume")
+        self.assertNotIn(str(script), plan.extra_targets)
+
+        plan = self.srv._plan_prompt(
+            "what did we extract from the database?", str(self.work), [str(script)], "deep", None, [],
+        )
+        self.assertEqual(plan.kind, "fresh")
+        self.assertEqual(plan.targets, [str(self.work.resolve())])
+
+        spec = self.work / "api.yaml"
+        spec.write_text("openapi: 3.0.0\n")
+        plan = self.srv._plan_prompt("review the API", str(self.work), [str(spec)], "deep", None, [])
+        self.assertEqual(plan.targets, [str(spec)])
+
+    def test_same_site_matching(self):
+        from strix_acp.server import same_site, target_host
+
+        self.assertEqual(target_host("https://Demo.Example/login?x=1"), "demo.example")
+        self.assertEqual(target_host("user@demo.example:8443/x"), "demo.example")
+        self.assertEqual(target_host("[2001:db8::1]:443"), "2001:db8::1")
+        self.assertTrue(same_site("api.demo.example", "demo.example"))
+        self.assertTrue(same_site("demo.example/login", "https://demo.example"))
+        self.assertFalse(same_site("demo.example", "other.example.com"))
+        self.assertTrue(same_site("/tmp/work/api", "/tmp/work"))
+        self.assertFalse(same_site("/tmp/work", "/tmp/other"))
+
     def test_new_forces_a_fresh_run(self):
         plan = self.plan(
             "/new demo.example redo it", last=("demo_ab12", str(self.work)), targets=["demo.example"]

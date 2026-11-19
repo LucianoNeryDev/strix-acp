@@ -86,6 +86,52 @@ def _docker_probe_timeout() -> float:
 # resolve, so a typo fails loudly instead of becoming an instruction.
 RUN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*_[0-9a-f]{4}$")
 
+
+def target_host(value: str) -> str | None:
+    """Return a comparable host for a URL, bare host, host:port or host/path.
+
+    Local paths and other non-network targets return ``None``; Strix compares
+    those by path, and they are handled separately.
+    """
+    raw = (value or "").strip().strip("\"'<>(){}").rstrip(",;.")
+    if not raw:
+        return None
+    if raw.startswith("git@"):
+        host = raw[len("git@"):].split(":", 1)[0].split("/", 1)[0]
+    elif "://" in raw:
+        host = raw.split("://", 1)[1].split("/", 1)[0]
+    elif raw.startswith(("/", "./", "../", "~")) or raw == "." or Path(raw).is_absolute():
+        return None
+    else:
+        host = raw.split("/", 1)[0]
+    host = host.rsplit("@", 1)[-1]
+    if host.startswith("["):
+        host = host[1:host.index("]")] if "]" in host else host
+    else:
+        host = host.split(":", 1)[0]
+    host = host.lower().strip(".")
+    return host or None
+
+
+def same_site(a: str, b: str) -> bool:
+    """Whether two targets belong to the same site or local scope.
+
+    A run for ``example.com`` covers ``www.example.com`` and
+    ``https://example.com/login``; a run for a directory covers paths inside it.
+    Unrelated hosts are unrelated: continuity is not guessed across sites.
+    """
+    ha, hb = target_host(a), target_host(b)
+    if ha and hb:
+        return ha == hb or ha.endswith("." + hb) or hb.endswith("." + ha)
+    if ha or hb:
+        return False
+    try:
+        pa = Path(a).expanduser().resolve()
+        pb = Path(b).expanduser().resolve()
+    except OSError:
+        return False
+    return pa == pb or pa in pb.parents or pb in pa.parents
+
 # Appended to every T3-driven scan. Kept short because the detailed procedure
 # is the data_access_escalation skill inside Strix.
 STANDING_INSTRUCTION = (
@@ -331,6 +377,9 @@ class ScanPlan:
     workspace_files: list[str] = field(default_factory=list)
     resume_run: str | None = None
     resume_workspace: str | None = None
+    # Targets in the prompt that the resumed run does not cover yet; they are
+    # authorized by this prompt and passed to the agent as added scope.
+    extra_targets: list[str] = field(default_factory=list)
     error: str = ""
 
 
@@ -625,10 +674,7 @@ class StrixAcpServer:
         if not session.last_run:
             # A reopened thread that predates this state file: adopt the most recent
             # run in its workspace so a follow-up continues instead of rescanning.
-            latest = self._latest_run_name(session.cwd)
-            if latest:
-                session.last_run = latest
-                session.last_run_dir = str(Path(session.cwd) / "strix_runs" / latest)
+            self._adopt_latest_run(session)
         with self._sessions_lock:
             self._sessions[session_id] = session
         self._save_session(session)
@@ -663,6 +709,10 @@ class StrixAcpServer:
             cwd=cwd,
             model_id=self._default_model,
         )
+        # A fork gets a new provider session in the same workspace and the client
+        # sends no fork metadata, so inherit the workspace's newest run here. The
+        # fork then continues that run's state instead of rescanning from zero.
+        adopted = self._adopt_latest_run(session)
         with self._sessions_lock:
             self._sessions[session_id] = session
         self._save_session(session)
@@ -676,6 +726,13 @@ class StrixAcpServer:
                 "configOptions": self._config_options(session),
             },
         )
+        if adopted:
+            self.emit_text(
+                session_id,
+                f"This workspace already has Strix runs, so follow-up prompts continue "
+                f"`{session.last_run}` (`{session.last_run_dir}`). Name a different target "
+                f"for a new scan, or `/new <target>` to force one.\n\n",
+            )
         self.send_update(
             session_id,
             {
@@ -985,6 +1042,38 @@ class StrixAcpServer:
         return max(candidates, key=lambda c: (c / "run.json").stat().st_mtime).name
 
     @staticmethod
+    def _run_targets(run_dir: Path) -> list[str]:
+        """The targets a run was authorized for, as recorded in its run.json."""
+        try:
+            rec = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        out: list[str] = []
+        for entry in rec.get("targets_info") or []:
+            if not isinstance(entry, dict):
+                continue
+            value = entry.get("original") or entry.get("target") or ""
+            if isinstance(value, str) and value and value not in out:
+                out.append(value)
+        return out
+
+    def _adopt_latest_run(self, session: SessionState) -> bool:
+        """Point a session at its workspace's newest run, targets included.
+
+        Targets matter as much as the name: without them the next prompt that
+        names the run's own site cannot be recognised as a continuation and
+        would start a second run with no access to the first one's state.
+        """
+        latest = self._latest_run_name(session.cwd)
+        if not latest:
+            return False
+        run_dir = Path(session.cwd) / "strix_runs" / latest
+        session.last_run = latest
+        session.last_run_dir = str(run_dir)
+        session.last_targets = self._run_targets(run_dir)
+        return True
+
+    @staticmethod
     def _locate_run(raw: str, cwd: str) -> tuple[str, str] | None:
         """Resolve a run name or a path to (run_name, workspace)."""
         cand = Path(raw).expanduser()
@@ -1023,16 +1112,24 @@ class StrixAcpServer:
         - ``/resume [run|path] [instruction]`` resumes the last run, or the named
           one, with the instruction as a new user message.
         - A prompt with no target continues the session's last run.
-        - A prompt that names the same target as the last run continues it too.
+        - A prompt that names the run's own target, or another host on the same
+          site (subdomain, URL with a path, host:port), continues it too; hosts
+          the run does not cover are handed to the agent as added scope.
         - ``/new`` (or ``/scan``, ``/quick``, ``/standard``, ``/deep``) and a
-          different target always start a fresh run.
+          target on a different site always start a fresh run.
         """
         text = prompt_text.strip()
         scan_mode = default_scan_mode
         force_new = False
+        require_target = False
         resume_selector: str | None = None
         resume_requested = False
         resume_instruction = ""
+
+        if last_run and not last_targets:
+            # State written before targets were persisted (or a thread adopted
+            # from its workspace): read them back so continuity can be decided.
+            last_targets = self._run_targets(Path(last_run[1]) / "strix_runs" / last_run[0])
 
         if text.startswith("/resume"):
             resume_requested = True
@@ -1049,17 +1146,22 @@ class StrixAcpServer:
             text = ""
         elif text.startswith("/new"):
             force_new = True
+            require_target = True
             text = text[len("/new"):].strip()
         elif text.startswith("/quick"):
             scan_mode = "quick"
+            force_new = True
             text = text[len("/quick"):].strip()
         elif text.startswith("/standard"):
             scan_mode = "standard"
+            force_new = True
             text = text[len("/standard"):].strip()
         elif text.startswith("/deep"):
             scan_mode = "deep"
+            force_new = True
             text = text[len("/deep"):].strip()
         elif text.startswith("/scan"):
+            force_new = True
             text = text[len("/scan"):].strip()
 
         targets: list[str] = []
@@ -1180,7 +1282,7 @@ class StrixAcpServer:
             if not tokens or (instruction == " ".join(tokens).strip() and "\n" in text):
                 instruction = text
 
-        if force_new and not had_explicit_targets:
+        if require_target and not had_explicit_targets:
             return ScanPlan(
                 kind="error",
                 scan_mode=scan_mode,
@@ -1190,10 +1292,15 @@ class StrixAcpServer:
         same_target = bool(
             had_explicit_targets
             and last_targets
-            and {t.lower() for t in targets} <= {t.lower() for t in last_targets}
+            and any(same_site(t, known) for t in targets for known in last_targets)
         )
         if (not had_explicit_targets or same_target) and last_run and not force_new:
             run_name, workspace = last_run
+            extra_targets = (
+                [t for t in targets if not any(same_site(t, known) for known in last_targets)]
+                if had_explicit_targets
+                else []
+            )
             return ScanPlan(
                 kind="resume",
                 scan_mode=scan_mode,
@@ -1203,6 +1310,7 @@ class StrixAcpServer:
                 workspace_files=attachments,
                 resume_run=run_name,
                 resume_workspace=workspace,
+                extra_targets=extra_targets,
             )
 
         return ScanPlan(
@@ -1400,6 +1508,16 @@ class StrixAcpServer:
                 # Bare /resume: the worker seeds its own continue message.
                 instruction = ""
 
+            if plan.kind == "resume" and plan.extra_targets:
+                scope = ", ".join(f"`{t}`" for t in plan.extra_targets)
+                instruction = (
+                    f"{instruction}\n\n"
+                    f"Additional in-scope target(s) authorized by this message: {scope}. "
+                    "Keep this run's existing state and findings: they are part of the "
+                    "same assessment, and the new targets are reachable from what was "
+                    "already found."
+                ).strip()
+
             # Quick Docker daemon pre-check before importing Strix + LiteLLM
             docker_bin = shutil.which("docker")
             if not docker_bin:
@@ -1459,7 +1577,14 @@ class StrixAcpServer:
                 self.emit_text(
                     s.session_id,
                     f"Resuming Strix run `{plan.resume_run}` — `{run_dir}`.\n\n"
-                    f"Instruction: {user_text.splitlines()[0][:200] if user_text else '(continue from where it left off)'}\n\n",
+                    + (
+                        "Added scope: "
+                        + ", ".join(f"`{t}`" for t in plan.extra_targets)
+                        + "\n\n"
+                        if plan.extra_targets
+                        else ""
+                    )
+                    + f"Instruction: {user_text.splitlines()[0][:200] if user_text else '(continue from where it left off)'}\n\n",
                 )
                 worker_args.extend(["--resume", plan.resume_run, "--workspace", plan.resume_workspace])
             else:
